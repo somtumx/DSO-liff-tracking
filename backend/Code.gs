@@ -237,14 +237,53 @@ function handleMessage(event) {
     return;
   }
 
-  // เรียกดูรายงานสรุป (เฉพาะกลุ่ม Admin)
-  if (text === '/Dispatch done') {
+  // เรียกดูรายงานสรุป (เฉพาะกลุ่ม Admin) รองรับระบุวันที่ เช่น /Dispatch done หรือ /Dispatch done 26.11.26
+  const matchReport = text.match(/^\/Dispatch\s+done(?:\s+(\d{1,2}[\.\/]\d{1,2}[\.\/]\d{2,4}))?\s*$/i);
+  if (matchReport) {
     const adminGroupId = getAdminGroupId(ss);
     if (groupId === adminGroupId) {
-      sendDailySummary(ss, event.replyToken);
+      let targetDateStr = null;
+      if (matchReport[1]) {
+        const parsed = parseCommandDate(matchReport[1]);
+        if (!parsed) {
+          replyText(event.replyToken, `⚠️ รูปแบบวันที่ไม่ถูกต้อง: ${matchReport[1]}\nตัวอย่าง: /Dispatch done 26.11.26`, ss);
+          return;
+        }
+        targetDateStr = parsed.shortDate;
+      }
+      sendDailySummary(ss, event.replyToken, targetDateStr);
     } else {
       logSystem('WARNING', 'UNAUTHORIZED_REPORT', 'พยายามเรียก Report จากกลุ่มอื่น', `Group ID: ${groupId}`, ss);
     }
+    return;
+  }
+
+  // คำนวณเวลาใน Log ใหม่ + แก้ไขทับ Work status + ส่งรายงานสรุป (เฉพาะกลุ่ม Admin)
+  // รองรับ: /Recalc, /Recalc 26.11.26, /คำนวณใหม่, /คำนวณใหม่ 26.11.69
+  const cleanRecalcText = text.replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s*(ครับ|คับ|คะ|ค่ะ|จ้า|จ๊ะ|นะ)\s*$/g, '').trim();
+  const matchRecalc = cleanRecalcText.match(/^\/(?:Recalc|คำนวณใหม่)(?:\s+(.+))?$/i);
+  if (matchRecalc) {
+    const adminGroupId = getAdminGroupId(ss);
+    if (groupId !== adminGroupId) {
+      logSystem('WARNING', 'UNAUTHORIZED_RECALC', 'พยายามสั่งคำนวณใหม่จากกลุ่มอื่น', `Group ID: ${groupId}`, ss);
+      return;
+    }
+
+    const nowParts = toBangkokParts(new Date());
+    let targetShortDate = `${nowParts.dd}/${nowParts.mm}/${nowParts.yy}`;
+    let targetFullDate = `${nowParts.dd}/${nowParts.mm}/${nowParts.yyyy}`;
+
+    if (matchRecalc[1] && matchRecalc[1].trim()) {
+      const parsed = parseCommandDate(matchRecalc[1].trim());
+      if (!parsed) {
+        replyText(event.replyToken, `⚠️ รูปแบบวันที่ไม่ถูกต้อง: ${matchRecalc[1].trim()}\nตัวอย่าง: /Recalc 26.11.26 หรือ /คำนวณใหม่ 26.11.69`, ss);
+        return;
+      }
+      targetShortDate = parsed.shortDate;
+      targetFullDate = parsed.fullDate;
+    }
+
+    handleRecalcCommand(ss, event.replyToken, targetShortDate, targetFullDate);
     return;
   }
 
@@ -721,16 +760,14 @@ function recalculateDailySequence(sheet, targetDayStr) {
 }
 
 // ==========================================
-// 7. SECONDARY ROUTING REPORT (สำหรับกลุ่ม Admin)
+// 7. SECONDARY ROUTING REPORT & RECALCULATION (สำหรับกลุ่ม Admin / ชีท)
 // ==========================================
-function sendDailySummary(ss, replyToken) {
+function buildDailySummaryFlex(ss, targetDateStr) {
   const sheet = ss.getSheetByName(SHEET_LOG_NAME);
-  const lastRow = sheet.getLastRow();
-  const todayStr = Utilities.formatDate(new Date(), 'Asia/Bangkok', 'dd/MM/yy');
+  const lastRow = sheet ? sheet.getLastRow() : 0;
 
-  if (lastRow <= 1) {
-    replyText(replyToken, 'ไม่มีข้อมูลงานในวันนี้', ss);
-    return;
+  if (!sheet || lastRow <= 1) {
+    return { empty: true, text: `ไม่มีข้อมูลงานประจำวันที่ ${targetDateStr}` };
   }
 
   const data = sheet.getRange(2, 1, lastRow - 1, 15).getValues();
@@ -739,8 +776,9 @@ function sendDailySummary(ss, replyToken) {
   let totalSH = 0;
 
   data.forEach(row => {
-    if (formatDateForComparison(row[0]) === todayStr) {
+    if (formatDateForComparison(row[0]) === targetDateStr) {
       const b = row[1];
+      if (!b) return;
       if (!branchMap[b]) {
         branchMap[b] = { bill: 0, sh: 0, bTime: '-', sTime: '-' };
       }
@@ -759,8 +797,7 @@ function sendDailySummary(ss, replyToken) {
 
   const branches = Object.keys(branchMap);
   if (branches.length === 0) {
-    replyText(replyToken, `ไม่มีรายการประจำวันที่ ${todayStr}`, ss);
-    return;
+    return { empty: true, text: `ไม่มีรายการประจำวันที่ ${targetDateStr}` };
   }
 
   const rows = branches.map(b => {
@@ -793,7 +830,7 @@ function sendDailySummary(ss, replyToken) {
           contents: [
             { type: 'text', text: 'SECONDARY ROUTING', color: '#F40009', size: 'xs', weight: 'bold' },
             { type: 'text', text: 'Daily Summary', size: 'xl', weight: 'bold', margin: 'xs' },
-            { type: 'text', text: `ประจำวันที่ ${todayStr}`, size: 'sm', color: '#888888' }
+            { type: 'text', text: `ประจำวันที่ ${targetDateStr}`, size: 'sm', color: '#888888' }
           ]
         },
         { type: 'image', url: LOGO_URL, aspectMode: 'fit', flex: 2, gravity: 'center' }
@@ -848,8 +885,327 @@ function sendDailySummary(ss, replyToken) {
     }
   };
 
-  sendToLine('reply', { replyToken: replyToken, messages: [{ type: 'flex', altText: 'รายงานสรุปงาน', contents: flexDashboard }] }, ss);
-  logSystem('INFO', 'REPORT_SENT', 'ส่งสรุปรายวันสำเร็จ', '', ss);
+  return { empty: false, flex: flexDashboard, totalDO: totalDO, totalSH: totalSH, branchCount: branches.length };
+}
+
+function sendDailySummary(ss, replyToken, customDateStr) {
+  const nowParts = toBangkokParts(new Date());
+  const targetDateStr = customDateStr || `${nowParts.dd}/${nowParts.mm}/${nowParts.yy}`;
+  const built = buildDailySummaryFlex(ss, targetDateStr);
+
+  if (built.empty) {
+    replyText(replyToken, built.text, ss);
+    return;
+  }
+
+  sendToLine('reply', {
+    replyToken: replyToken,
+    messages: [{ type: 'flex', altText: `รายงานสรุปงาน ${targetDateStr}`, contents: built.flex }]
+  }, ss);
+  logSystem('INFO', 'REPORT_SENT', `ส่งสรุปรายวันสำเร็จ (${targetDateStr})`, '', ss);
+}
+
+/**
+ * LINE Admin command handler for /Recalc [DD.MM.YY] or /คำนวณใหม่ [DD.MM.YY]
+ * 1) Recalculates Diff_1 & Diff_2 in Log for the selected Working Date
+ * 2) Overwrites existing matching rows in Work status in-place (preserving col K:M notes)
+ * 3) Replies with both summary status and the updated Daily Summary Flex report
+ */
+function handleRecalcCommand(ss, replyToken, targetShortDate, targetFullDate) {
+  const res = recalculateAndSyncByDate(ss, targetShortDate, targetFullDate);
+  if (res.status !== 'success') {
+    replyText(replyToken, `❌ คำนวณเวลาใหม่ไม่สำเร็จ: ${res.message || 'เกิดข้อผิดพลาด'}`, ss);
+    return;
+  }
+
+  if (res.totalLogRows === 0) {
+    replyText(replyToken, `⚠️ ไม่พบรายการในชีท Log สำหรับวันที่ ${targetShortDate}`, ss);
+    return;
+  }
+
+  const summaryText =
+    `✅ คำนวณเวลาและอัปเดต Work status เรียบร้อยแล้ว\n` +
+    `วันที่: ${targetShortDate}\n` +
+    `- ตรวจสอบ Log: ${res.totalLogRows} รายการ (แก้เวลา ${res.logUpdated} แถว)\n` +
+    `- แก้ไขทับ Work status: ${res.wsUpdated} บรรทัด` +
+    (res.wsInserted > 0 ? `\n- เพิ่มบรรทัดที่ตกหล่น: ${res.wsInserted} บรรทัด` : '');
+
+  const messages = [{ type: 'text', text: summaryText }];
+  const built = buildDailySummaryFlex(ss, targetShortDate);
+  if (!built.empty) {
+    messages.push({ type: 'flex', altText: `รายงานสรุปงาน ${targetShortDate}`, contents: built.flex });
+  }
+
+  sendToLine('reply', { replyToken: replyToken, messages: messages }, ss);
+}
+
+/**
+ * Core recalculation engine:
+ * - Recalculates Diff_1 (col K) and Diff_2 (col O) in Log for targetShortDate (dd/MM/yy)
+ * - Overwrites matching Work status rows (cols A:J) in-place without duplicating rows or wiping K:M notes
+ * - Appends any completed shipments missing from Work status
+ */
+function recalculateAndSyncByDate(ss, targetShortDate, targetFullDate) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(LOCK_TIMEOUT_MS);
+
+  try {
+    const logSheet = ss.getSheetByName(SHEET_LOG_NAME);
+    if (!logSheet || logSheet.getLastRow() <= 1) {
+      return { status: 'success', date: targetShortDate, totalLogRows: 0, logUpdated: 0, wsUpdated: 0, wsInserted: 0 };
+    }
+
+    // Build Branch lookup map once (BranchCode -> SalesOffice)
+    const branchOfficeMap = {};
+    const branchSheet = ss.getSheetByName(SHEET_BRANCH_NAME);
+    if (branchSheet && branchSheet.getLastRow() > 1) {
+      const bData = branchSheet.getRange(2, 1, branchSheet.getLastRow() - 1, 3).getValues();
+      for (let i = 0; i < bData.length; i++) {
+        const code = String(bData[i][0] || '').trim().toUpperCase();
+        if (code) branchOfficeMap[code] = bData[i][2] || '-';
+      }
+    }
+
+    const logLastRow = logSheet.getLastRow();
+    const logData = logSheet.getRange(2, 1, logLastRow - 1, 16).getValues();
+
+    let totalLogRows = 0;
+    let logUpdated = 0;
+    const completedOrders = [];
+
+    for (let i = 0; i < logData.length; i++) {
+      const row = logData[i];
+      if (!row[1]) continue;
+      if (formatDateForComparison(row[0]) !== targetShortDate) continue;
+
+      totalLogRows++;
+      const rowNum = i + 2;
+      const branchCode = String(row[1]).trim().toUpperCase();
+      const billTime = formatTimeOnly(row[5]);
+      const confTime = formatTimeOnly(row[8]);
+      const shipTime = formatTimeOnly(row[12]);
+
+      const newDiff1 = (billTime !== '-' && confTime !== '-') ? calculateTimeDiff(billTime, confTime) : '';
+      const newDiff2 = (confTime !== '-' && shipTime !== '-') ? calculateTimeDiff(confTime, shipTime) : '';
+
+      const oldDiff1 = row[10] === null || row[10] === undefined ? '' : row[10];
+      const oldDiff2 = row[14] === null || row[14] === undefined ? '' : row[14];
+
+      let rowChanged = false;
+      if (String(oldDiff1) !== String(newDiff1)) {
+        logSheet.getRange(rowNum, 11).setValue(newDiff1);
+        rowChanged = true;
+      }
+      if (String(oldDiff2) !== String(newDiff2)) {
+        logSheet.getRange(rowNum, 15).setValue(newDiff2);
+        rowChanged = true;
+      }
+      if (rowChanged) logUpdated++;
+
+      if (shipTime !== '-') {
+        const deliveryFull = formatDateFullYear(row[2]);
+        const deliveryShort = formatDateForComparison(row[2]);
+        completedOrders.push({
+          workingDate: formatDateFullYear(row[0]) !== '-' ? formatDateFullYear(row[0]) : targetFullDate,
+          deliveryDate: deliveryFull,
+          deliveryShortDate: deliveryShort,
+          salesOffice: branchOfficeMap[branchCode] || '-',
+          branchCode: branchCode,
+          billTime: billTime !== '-' ? billTime + ':00' : '-',
+          confTime: confTime !== '-' ? confTime + ':00' : '-',
+          shipTime: shipTime + ':00',
+          amount: parseCleanInt(row[13]),
+          operationTime: formatDuration(confTime, shipTime),
+          respondence: String(row[11] || row[7] || row[4] || '').trim()
+        });
+      }
+    }
+
+    // Sync completed orders into Work status (overwrite matching rows in-place)
+    let wsSheet = ss.getSheetByName(SHEET_REPORT_NAME);
+    if (!wsSheet) {
+      wsSheet = ss.insertSheet(SHEET_REPORT_NAME);
+      wsSheet.appendRow([
+        'Working Date', 'Delivery Date', 'Sales office', 'เขตการขาย',
+        'Time to send Order', 'Confirm order time', 'Shipment created time',
+        'Shipments', 'Operation time', 'Respondence',
+        'สถานะ SH', 'ข้อติดขัด', 'หมายเหตุ', 'Month', 'Weekday', 'Weeknum'
+      ]);
+      wsSheet.getRange('A1:P1').setFontWeight('bold');
+    }
+
+    const wsLastRow = wsSheet.getLastRow();
+    const wsExactMap = {};   // key: BRANCH|deliveryShortDate -> [rowNum, ...]
+    const wsBranchMap = {};  // fallback key: BRANCH -> [rowNum, ...]
+    const usedWsRows = {};
+    const wsExistingKP = {};
+
+    if (wsLastRow > 1) {
+      const wsData = wsSheet.getRange(2, 1, wsLastRow - 1, 16).getValues();
+      for (let i = 0; i < wsData.length; i++) {
+        if (formatDateForComparison(wsData[i][0]) !== targetShortDate) continue;
+        const rNum = i + 2;
+        const bCode = String(wsData[i][3] || '').trim().toUpperCase();
+        const dShort = formatDateForComparison(wsData[i][1]);
+        if (!bCode) continue;
+
+        const exactKey = `${bCode}|${dShort}`;
+        if (!wsExactMap[exactKey]) wsExactMap[exactKey] = [];
+        wsExactMap[exactKey].push(rNum);
+
+        if (!wsBranchMap[bCode]) wsBranchMap[bCode] = [];
+        wsBranchMap[bCode].push(rNum);
+
+        wsExistingKP[rNum] = wsData[i].slice(10, 16);
+      }
+    }
+
+    const takeUnusedRow = (list) => {
+      if (!list) return -1;
+      while (list.length > 0) {
+        const candidate = list.shift();
+        if (!usedWsRows[candidate]) {
+          usedWsRows[candidate] = true;
+          return candidate;
+        }
+      }
+      return -1;
+    };
+
+    let wsUpdated = 0;
+    let wsInserted = 0;
+
+    completedOrders.forEach(item => {
+      const exactKey = `${item.branchCode}|${item.deliveryShortDate}`;
+      let matchRow = takeUnusedRow(wsExactMap[exactKey]);
+      if (matchRow === -1) {
+        matchRow = takeUnusedRow(wsBranchMap[item.branchCode]);
+      }
+
+      const coreCols = [
+        item.workingDate,
+        item.deliveryDate,
+        item.salesOffice,
+        item.branchCode,
+        item.billTime,
+        item.confTime,
+        item.shipTime,
+        item.amount,
+        item.operationTime,
+        item.respondence
+      ];
+
+      if (matchRow !== -1) {
+        // Overwrite A:J in-place and preserve existing K:M notes (fill N:P formulas only if empty)
+        wsSheet.getRange(matchRow, 1, 1, 10).setValues([coreCols]);
+        const kp = wsExistingKP[matchRow] || [];
+        if (!kp[3] || !kp[4] || !kp[5]) {
+          wsSheet.getRange(matchRow, 14, 1, 3).setValues([[
+            `=MONTH(A${matchRow})`,
+            `=WEEKDAY(A${matchRow})`,
+            `=WEEKNUM(A${matchRow})`
+          ]]);
+        }
+        wsUpdated++;
+      } else {
+        const nextRow = wsSheet.getLastRow() + 1;
+        wsSheet.getRange(nextRow, 1, 1, 16).setValues([[
+          ...coreCols,
+          'ปกติ',
+          'ไม่มี',
+          'ไม่มี',
+          `=MONTH(A${nextRow})`,
+          `=WEEKDAY(A${nextRow})`,
+          `=WEEKNUM(A${nextRow})`
+        ]]);
+        wsInserted++;
+      }
+    });
+
+    SpreadsheetApp.flush();
+
+    logSystem(
+      'SUCCESS',
+      'RECALC_OK',
+      `คำนวณเวลาและซิงก์ Work status วันที่ ${targetShortDate} สำเร็จ`,
+      `Log: ${totalLogRows} (Updated ${logUpdated}), WorkStatus Updated: ${wsUpdated}, Inserted: ${wsInserted}`,
+      ss
+    );
+
+    return {
+      status: 'success',
+      date: targetShortDate,
+      totalLogRows: totalLogRows,
+      logUpdated: logUpdated,
+      wsUpdated: wsUpdated,
+      wsInserted: wsInserted
+    };
+  } catch (error) {
+    logSystem('ERROR', 'RECALC_CRASH', `คำนวณเวลาใหม่วันที่ ${targetShortDate} ล้มเหลว`, error.stack || error.message, ss);
+    return { status: 'error', message: error.message || String(error) };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ------------------------------------------
+// Google Sheets Menu & Manual Editor Helpers
+// ------------------------------------------
+function onOpen() {
+  try {
+    SpreadsheetApp.getUi()
+      .createMenu('⚙️ DSO Tools')
+      .addItem('คำนวณเวลาและอัปเดต Work status ใหม่ (เลือกวันที่)...', 'promptRecalculateDate')
+      .addItem('ตัดแถวเก่าใน SystemLog ทันที', 'trimSystemLogNow')
+      .addToUi();
+  } catch (_e) {}
+}
+
+function promptRecalculateDate() {
+  const ui = SpreadsheetApp.getUi();
+  const nowParts = toBangkokParts(new Date());
+  const defaultInput = `${nowParts.dd}.${nowParts.mm}.${nowParts.yy}`;
+
+  const response = ui.prompt(
+    'คำนวณเวลาและอัปเดต Work status ใหม่',
+    `ระบุวันที่ (Working Date) ที่ต้องการคำนวณใหม่ เช่น ${defaultInput} หรือ ${nowParts.dd}.${nowParts.mm}.${parseInt(nowParts.yyyy, 10) + 543}\n(เว้นว่างเพื่อใช้วันนี้: ${defaultInput})`,
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  const inputStr = response.getResponseText().trim() || defaultInput;
+  const parsed = parseCommandDate(inputStr);
+  if (!parsed) {
+    ui.alert('รูปแบบวันที่ไม่ถูกต้อง', `กรุณาระบุวันที่ในรูปแบบ DD.MM.YY เช่น ${defaultInput}`, ui.ButtonSet.OK);
+    return;
+  }
+
+  const res = recalculateAndSyncByDate(getSpreadsheet(), parsed.shortDate, parsed.fullDate);
+  if (res.status === 'success') {
+    ui.alert(
+      'คำนวณเวลาใหม่สำเร็จ',
+      `วันที่: ${res.date}\n- ตรวจสอบ Log: ${res.totalLogRows} รายการ (แก้เวลา ${res.logUpdated} แถว)\n- แก้ไขทับ Work status: ${res.wsUpdated} บรรทัด\n- เพิ่มบรรทัดที่ตกหล่น: ${res.wsInserted} บรรทัด`,
+      ui.ButtonSet.OK
+    );
+  } else {
+    ui.alert('เกิดข้อผิดพลาด', res.message || 'ไม่สามารถคำนวณเวลาใหม่ได้', ui.ButtonSet.OK);
+  }
+}
+
+function recalculateToday() {
+  const nowParts = toBangkokParts(new Date());
+  return recalculateAndSyncByDate(
+    getSpreadsheet(),
+    `${nowParts.dd}/${nowParts.mm}/${nowParts.yy}`,
+    `${nowParts.dd}/${nowParts.mm}/${nowParts.yyyy}`
+  );
+}
+
+function recalculateByDate(dateInputStr) {
+  const parsed = parseCommandDate(dateInputStr);
+  if (!parsed) throw new Error('Invalid date format: ' + dateInputStr + ' (expected DD.MM.YY)');
+  return recalculateAndSyncByDate(getSpreadsheet(), parsed.shortDate, parsed.fullDate);
 }
 
 // ==========================================
@@ -1085,7 +1441,18 @@ function formatDateForComparison(v) {
     const p = toBangkokParts(v);
     return `${p.dd}/${p.mm}/${p.yy}`;
   }
-  return String(v || '').trim();
+  const str = String(v || '').trim();
+  const m = str.match(/^(\d{1,2})[\/\.\-](\d{1,2})[\/\.\-](\d{2,4})/);
+  if (m) {
+    const dd = m[1].padStart(2, '0');
+    const mm = m[2].padStart(2, '0');
+    let y = parseInt(m[3], 10);
+    if (y >= 2500) y -= 543;
+    else if (y >= 50 && y <= 99) y -= 43;
+    const yy = String(y % 100).padStart(2, '0');
+    return `${dd}/${mm}/${yy}`;
+  }
+  return str;
 }
 
 function formatDateFullYear(v) {
