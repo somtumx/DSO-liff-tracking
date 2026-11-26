@@ -225,23 +225,82 @@ function handleMessage(event) {
     return;
   }
 
-  // ตั้งค่ากลุ่ม Admin
-  if (text === '/AdminGroup') {
+  const cleanCommandText = text.replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s*(ครับ|คับ|คะ|ค่ะ|จ้า|จ๊ะ|นะ)\s*$/g, '').trim();
+
+  // ตั้งค่า / เพิ่มกลุ่ม Admin (รองรับหลายกลุ่มไม่จำกัด เช่น /AdminGroup หรือ /AdminGroup ชื่อกลุ่ม)
+  const matchAddAdmin = cleanCommandText.match(/^\/AdminGroup(?:\s+(.+))?$/i);
+  if (matchAddAdmin) {
     if (groupId === 'NO_GROUP') {
       replyText(event.replyToken, 'ใช้คำสั่งนี้ได้เฉพาะในกลุ่มไลน์เท่านั้น', ss);
       return;
     }
-    saveAdminGroupId(ss, groupId);
-    replyText(event.replyToken, 'บันทึกกลุ่มนี้เป็น Admin Group เรียบร้อยแล้ว', ss);
-    logSystem('INFO', 'SETUP_ADMIN', 'บันทึกกลุ่มแอดมินใหม่', groupId, ss);
+    const label = matchAddAdmin[1] ? matchAddAdmin[1].trim() : '';
+    const res = addAdminGroupId(ss, groupId, label);
+    if (res.added) {
+      const labelInfo = label ? ` (${label})` : '';
+      replyText(
+        event.replyToken,
+        `✅ เพิ่มกลุ่มนี้${labelInfo}เป็น Admin Group เรียบร้อยแล้วครับ\nกลุ่ม Admin ทั้งหมดตอนนี้: ${res.total} กลุ่ม`,
+        ss
+      );
+      logSystem('INFO', 'SETUP_ADMIN', 'เพิ่มกลุ่มแอดมินใหม่', `${groupId}${labelInfo} (รวม ${res.total} กลุ่ม)`, ss);
+    } else if (res.labelUpdated) {
+      replyText(
+        event.replyToken,
+        `✅ อัปเดตชื่อกลุ่ม Admin เป็น "${label}" เรียบร้อยแล้วครับ\nกลุ่ม Admin ทั้งหมดตอนนี้: ${res.total} กลุ่ม`,
+        ss
+      );
+      logSystem('INFO', 'UPDATE_ADMIN_LABEL', 'อัปเดตชื่อกลุ่มแอดมิน', `${groupId} (${label})`, ss);
+    } else {
+      replyText(
+        event.replyToken,
+        `ℹ️ กลุ่มนี้มีสิทธิ์ Admin Group อยู่แล้วครับ\nกลุ่ม Admin ทั้งหมดตอนนี้: ${res.total} กลุ่ม`,
+        ss
+      );
+    }
+    return;
+  }
+
+  // ถอนสิทธิ์กลุ่ม Admin ปัจจุบัน (เฉพาะกลุ่มที่เป็น Admin อยู่แล้ว)
+  if (/^\/(?:RemoveAdminGroup|ลบAdminGroup)$/i.test(cleanCommandText)) {
+    if (!isAdminGroup(ss, groupId)) {
+      logSystem('WARNING', 'UNAUTHORIZED_ADMIN_CMD', 'พยายามลบสิทธิ์ Admin จากกลุ่มอื่น', `Group ID: ${groupId}`, ss);
+      return;
+    }
+    const res = removeAdminGroupId(ss, groupId);
+    replyText(
+      event.replyToken,
+      `✅ ลบกลุ่มนี้ออกจากสิทธิ์ Admin Group เรียบร้อยแล้วครับ\nเหลือกลุ่ม Admin ทั้งหมด: ${res.total} กลุ่ม`,
+      ss
+    );
+    logSystem('INFO', 'REMOVE_ADMIN', 'ลบกลุ่มแอดมินออก', `${groupId} (เหลือ ${res.total} กลุ่ม)`, ss);
+    return;
+  }
+
+  // ดูรายชื่อกลุ่ม Admin ทั้งหมด (เฉพาะกลุ่มที่เป็น Admin)
+  if (/^\/AdminList$/i.test(cleanCommandText)) {
+    if (!isAdminGroup(ss, groupId)) {
+      logSystem('WARNING', 'UNAUTHORIZED_ADMIN_CMD', 'พยายามดูรายชื่อ Admin จากกลุ่มอื่น', `Group ID: ${groupId}`, ss);
+      return;
+    }
+    const entries = getAdminGroupEntries(ss);
+    const lines = entries.map((item, idx) => {
+      const currentTag = item.groupId === groupId ? ' (กลุ่มนี้)' : '';
+      const noteTag = item.note ? ` — ${item.note}` : '';
+      return `${idx + 1}. ${item.groupId}${noteTag}${currentTag}`;
+    });
+    replyText(
+      event.replyToken,
+      `🛡️ รายชื่อกลุ่ม Admin ทั้งหมด (${entries.length} กลุ่ม)\n${lines.join('\n')}`,
+      ss
+    );
     return;
   }
 
   // เรียกดูรายงานสรุป (เฉพาะกลุ่ม Admin) รองรับระบุวันที่ เช่น /Dispatch done หรือ /Dispatch done 26.11.26
-  const matchReport = text.match(/^\/Dispatch\s+done(?:\s+(\d{1,2}[\.\/]\d{1,2}[\.\/]\d{2,4}))?\s*$/i);
+  const matchReport = cleanCommandText.match(/^\/Dispatch\s+done(?:\s+(\d{1,2}[\.\/]\d{1,2}[\.\/]\d{2,4}))?$/i);
   if (matchReport) {
-    const adminGroupId = getAdminGroupId(ss);
-    if (groupId === adminGroupId) {
+    if (isAdminGroup(ss, groupId)) {
       let targetDateStr = null;
       if (matchReport[1]) {
         const parsed = parseCommandDate(matchReport[1]);
@@ -260,11 +319,9 @@ function handleMessage(event) {
 
   // คำนวณเวลาใน Log ใหม่ + แก้ไขทับ Work status + ส่งรายงานสรุป (เฉพาะกลุ่ม Admin)
   // รองรับ: /Recalc, /Recalc 26.11.26, /คำนวณใหม่, /คำนวณใหม่ 26.11.69
-  const cleanRecalcText = text.replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s*(ครับ|คับ|คะ|ค่ะ|จ้า|จ๊ะ|นะ)\s*$/g, '').trim();
-  const matchRecalc = cleanRecalcText.match(/^\/(?:Recalc|คำนวณใหม่)(?:\s+(.+))?$/i);
+  const matchRecalc = cleanCommandText.match(/^\/(?:Recalc|คำนวณใหม่)(?:\s+(.+))?$/i);
   if (matchRecalc) {
-    const adminGroupId = getAdminGroupId(ss);
-    if (groupId !== adminGroupId) {
+    if (!isAdminGroup(ss, groupId)) {
       logSystem('WARNING', 'UNAUTHORIZED_RECALC', 'พยายามสั่งคำนวณใหม่จากกลุ่มอื่น', `Group ID: ${groupId}`, ss);
       return;
     }
@@ -1334,16 +1391,165 @@ function writeToReportSheet(ss, data) {
   }
 }
 
+function isAdminConfigKey(key) {
+  const k = String(key || '').trim().toUpperCase();
+  return /^ADMIN_GROUP_ID(?:S|_\d+)?$/.test(k);
+}
+
+function computeAdminRowFlags(data) {
+  const flags = [];
+  let inAdminBlock = false;
+  for (let i = 0; i < data.length; i++) {
+    const key = String(data[i][0] || '').trim();
+    if (key) {
+      inAdminBlock = isAdminConfigKey(key);
+    }
+    flags.push(inAdminBlock);
+  }
+  return flags;
+}
+
+/**
+ * Reads all Admin Group entries from the Config sheet (unlimited groups).
+ * Supports:
+ *  - Multiple rows with ADMIN_GROUP_ID (or ADMIN_GROUP_ID_1, ADMIN_GROUP_ID_2, ..., ADMIN_GROUP_IDS)
+ *  - Continuation rows with blank Column A under an ADMIN_GROUP_ID row
+ *  - Multiple IDs separated by comma, semicolon, newline, or whitespace inside Column B
+ *  - Optional human-readable label/note in Column C
+ */
+function getAdminGroupEntries(ss) {
+  const sheet = ss.getSheetByName(SHEET_CONFIG_NAME);
+  if (!sheet) return [];
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 1) return [];
+  const lastCol = Math.max(sheet.getLastColumn(), 2);
+  const data = sheet.getRange(1, 1, lastRow, Math.min(lastCol, 3)).getValues();
+  const adminFlags = computeAdminRowFlags(data);
+
+  const entries = [];
+  const seen = {};
+  for (let i = 0; i < data.length; i++) {
+    if (!adminFlags[i]) continue;
+    const rawVal = String(data[i][1] || '').trim();
+    if (!rawVal) continue;
+    const note = data[i].length >= 3 ? String(data[i][2] || '').trim() : '';
+    const tokens = rawVal.split(/[,;\n\r\s]+/).map(s => s.trim()).filter(Boolean);
+    for (let t = 0; t < tokens.length; t++) {
+      const id = tokens[t];
+      if (!seen[id]) {
+        seen[id] = true;
+        entries.push({ groupId: id, note: note, rowIndex: i + 1, isMultiCell: tokens.length > 1 });
+      }
+    }
+  }
+  return entries;
+}
+
+function getAdminGroupIds(ss) {
+  return getAdminGroupEntries(ss).map(e => e.groupId);
+}
+
+function isAdminGroup(ss, groupId) {
+  if (!groupId || groupId === 'NO_GROUP') return false;
+  return getAdminGroupIds(ss).indexOf(String(groupId).trim()) !== -1;
+}
+
+function addAdminGroupId(ss, groupId, label) {
+  const targetId = String(groupId || '').trim();
+  const cleanLabel = String(label || '').trim();
+  const lock = LockService.getScriptLock();
+  const acquired = lock.tryLock(10000);
+  try {
+    let sheet = ss.getSheetByName(SHEET_CONFIG_NAME);
+    if (!sheet) sheet = ss.insertSheet(SHEET_CONFIG_NAME);
+
+    const entries = getAdminGroupEntries(ss);
+    const existing = entries.find(e => e.groupId === targetId);
+    if (existing) {
+      let labelUpdated = false;
+      if (cleanLabel && !existing.isMultiCell && existing.note !== cleanLabel) {
+        sheet.getRange(existing.rowIndex, 3).setValue(cleanLabel);
+        labelUpdated = true;
+      }
+      return { added: false, labelUpdated: labelUpdated, total: entries.length, ids: entries.map(e => e.groupId) };
+    }
+
+    const p = toBangkokParts(new Date());
+    const noteToWrite = cleanLabel || `เพิ่มเมื่อ ${p.dd}/${p.mm}/${p.yyyy} ${p.HH}:${p.mm}`;
+    sheet.appendRow(['ADMIN_GROUP_ID', targetId, noteToWrite]);
+
+    const updatedIds = entries.map(e => e.groupId).concat([targetId]);
+    return { added: true, labelUpdated: false, total: updatedIds.length, ids: updatedIds };
+  } finally {
+    if (acquired) {
+      try { lock.releaseLock(); } catch (e) {}
+    }
+  }
+}
+
+function removeAdminGroupId(ss, groupId) {
+  const targetId = String(groupId || '').trim();
+  const lock = LockService.getScriptLock();
+  const acquired = lock.tryLock(10000);
+  try {
+    const sheet = ss.getSheetByName(SHEET_CONFIG_NAME);
+    if (!sheet || sheet.getLastRow() < 1) {
+      return { removed: false, total: 0, ids: [] };
+    }
+
+    const lastRow = sheet.getLastRow();
+    const data = sheet.getRange(1, 1, lastRow, 2).getValues();
+    const adminFlags = computeAdminRowFlags(data);
+    let removed = false;
+
+    for (let i = data.length - 1; i >= 0; i--) {
+      if (!adminFlags[i]) continue;
+      const rawVal = String(data[i][1] || '').trim();
+      if (!rawVal) continue;
+      const tokens = rawVal.split(/[,;\n\r\s]+/).map(s => s.trim()).filter(Boolean);
+      const remaining = tokens.filter(id => id !== targetId);
+      if (remaining.length !== tokens.length) {
+        removed = true;
+        if (remaining.length === 0) {
+          const rowKey = String(data[i][0] || '').trim();
+          if (rowKey && i + 1 < data.length && adminFlags[i + 1] && !String(data[i + 1][0] || '').trim()) {
+            sheet.getRange(i + 2, 1).setValue(rowKey);
+            data[i + 1][0] = rowKey;
+          }
+          if (sheet.getMaxRows() > 1) {
+            sheet.deleteRow(i + 1);
+            data.splice(i, 1);
+            adminFlags.splice(i, 1);
+          } else {
+            sheet.getRange(i + 1, 1, 1, Math.max(sheet.getLastColumn(), 3)).clearContent();
+            data[i][0] = '';
+            data[i][1] = '';
+            adminFlags[i] = false;
+          }
+        } else {
+          sheet.getRange(i + 1, 2).setValue(remaining.join(', '));
+          data[i][1] = remaining.join(', ');
+        }
+      }
+    }
+
+    const ids = getAdminGroupIds(ss);
+    return { removed: removed, total: ids.length, ids: ids };
+  } finally {
+    if (acquired) {
+      try { lock.releaseLock(); } catch (e) {}
+    }
+  }
+}
+
+// Legacy aliases kept for backward compatibility
 function saveAdminGroupId(ss, groupId) {
-  let sheet = ss.getSheetByName(SHEET_CONFIG_NAME);
-  if (!sheet) sheet = ss.insertSheet(SHEET_CONFIG_NAME);
-  sheet.getRange('A1:B1').setValues([['ADMIN_GROUP_ID', groupId]]);
+  return addAdminGroupId(ss, groupId, '');
 }
 
 function getAdminGroupId(ss) {
-  const sheet = ss.getSheetByName(SHEET_CONFIG_NAME);
-  if (!sheet) return null;
-  return sheet.getRange('B1').getValue().toString().trim();
+  const ids = getAdminGroupIds(ss);
+  return ids.length > 0 ? ids[0] : null;
 }
 
 function parseCleanInt(val) {
