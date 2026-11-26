@@ -1027,16 +1027,36 @@ function formatDuration(startStr, endStr) {
   return `${h}:${m.toString().padStart(2, '0')}:00`;
 }
 
+const BKK_DTF = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Asia/Bangkok',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  hourCycle: 'h23'
+});
+
 function toBangkokParts(dateObj) {
-  const shifted = new Date(dateObj.getTime() + 7 * 60 * 60 * 1000);
-  const fullYear = shifted.getUTCFullYear();
+  // Uses IANA Asia/Bangkok tzdata so both 1899-12-30 time-only cells (LMT UTC+06:42:04)
+  // and modern dates (UTC+07:00) match Google Sheets display time exactly with zero Java RPC calls.
+  const parts = BKK_DTF.formatToParts(dateObj);
+  let dd = '00', mm = '00', yyyy = '0000', HH = '00', MI = '00';
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    if (p.type === 'day') dd = p.value;
+    else if (p.type === 'month') mm = p.value;
+    else if (p.type === 'year') yyyy = p.value;
+    else if (p.type === 'hour') HH = p.value === '24' ? '00' : p.value;
+    else if (p.type === 'minute') MI = p.value;
+  }
   return {
-    dd: String(shifted.getUTCDate()).padStart(2, '0'),
-    mm: String(shifted.getUTCMonth() + 1).padStart(2, '0'),
-    yyyy: String(fullYear),
-    yy: String(fullYear % 100).padStart(2, '0'),
-    HH: String(shifted.getUTCHours()).padStart(2, '0'),
-    MI: String(shifted.getUTCMinutes()).padStart(2, '0')
+    dd: dd,
+    mm: mm,
+    yyyy: yyyy,
+    yy: yyyy.slice(-2),
+    HH: HH,
+    MI: MI
   };
 }
 
@@ -1079,10 +1099,8 @@ function formatDateFullYear(v) {
 
 function getThaiDateTime(d) {
   const thaiMonths = ['ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.', 'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.'];
-  const shifted = new Date(d.getTime() + 7 * 60 * 60 * 1000);
-  const HH = String(shifted.getUTCHours()).padStart(2, '0');
-  const MI = String(shifted.getUTCMinutes()).padStart(2, '0');
-  return `${shifted.getUTCDate()} ${thaiMonths[shifted.getUTCMonth()]} ${shifted.getUTCFullYear() + 543} ${HH}:${MI} น.`;
+  const p = toBangkokParts(d);
+  return `${parseInt(p.dd, 10)} ${thaiMonths[parseInt(p.mm, 10) - 1]} ${parseInt(p.yyyy, 10) + 543} ${p.HH}:${p.MI} น.`;
 }
 
 function replyText(replyToken, message, ss) {
